@@ -1,0 +1,106 @@
+# ─────────────────────────────────────────────────────────────
+#  PERSONAL / PRIVATE DATA — never commit
+# ─────────────────────────────────────────────────────────────
+.env
+h1b_slot_log.csv
+*.passport.json
+
+# ─────────────────────────────────────────────────────────────
+#  Databases & benchmark artifacts
+# ─────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# FAISS index files (rebuilt from SQLite automatically)
+*.faiss
+*_mem_idx.meta.json
+*_pass_idx.meta.json
+
+# ─────────────────────────────────────────────────────────────
+#  Large vendored / generated dirs — not part of the release
+# ─────────────────────────────────────────────────────────────
+memorybench/
+eval_runs/
+docs/
+testbench/
+.cursor/
+.pycache/
+memory_layer.egg-info/
+
+# ─────────────────────────────────────────────────────────────
+#  Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# ─────────────────────────────────────────────────────────────
+#  Env / IDE / OS
+# ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ─────────────────────────────────────────────────────────────
+#  Logs
+# ─────────────────────────────────────────────────────────────
+*.log
+mcp_trace.log
+
+# ─────────────────────────────────────────────────────────────
+#  Model cache (downloaded on first run)
+# ─────────────────────────────────────────────────────────────
+.cache/
+models/
+
+# ─────────────────────────────────────────────────────────────
+#  Paper: keep ONLY the canonical combined .tex/.pdf + curated
+#  reproduction scripts/figures. Ignore drafts, build artifacts,
+#  and scratch runs.
+# ─────────────────────────────────────────────────────────────
+paper/*.tmp
+paper/tmp*.tmp
+paper/*.aux
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.out
+paper/*.synctex.gz
+paper/*.zip
+paper/build.log
+paper/__pycache__/
+paper/latex_bundle/
+paper/abstention_run_sai/
+paper/zi7OL9kQ
+# superseded drafts
+paper/epistemic_memory.tex
+paper/epistemic_memory.pdf
+paper/epistemic_memory.aux
+paper/epistemic_memory.log
+paper/epistemic_memory.out
+paper/epistemic_memory.fls
+paper/epistemic_memory.fdb_latexmk
+paper/paper.tex
+paper/paper.md
+paper/paper.html
+# superseded / broken scripts
+paper/experiments_full.py
+paper/validate_epistemic.py
+paper/regenerate_fig2_v2.py
+paper/build_html.py
+paper/fair_eval/run_fair_ablation.py
+paper/fair_eval/run_fair_ablation_fixed.py
+paper/fair_eval/__pycache__/
+
+# ─────────────────────────────────────────────────────────────
+#  Scratch
+# ─────────────────────────────────────────────────────────────
+*.tmp

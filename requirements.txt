@@ -1,0 +1,40 @@
+# Memory Layer - Dependencies
+# ============================
+
+# Core
+pydantic>=2.0.0
+numpy>=1.24.0
+
+# Local embeddings (fully offline after first download)
+sentence-transformers>=2.2.0
+
+# FAISS vector index (fast ANN search; falls back to numpy if not installed)
+faiss-cpu>=1.7.0
+
+# REST API server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# OpenAI (optional: for openai embeddings and LLM fact extraction)
+openai>=1.0.0
+
+# Google Gemini (optional: for gemini embeddings — best quality, multimodal-ready)
+google-genai>=1.0.0
+
+# Document ingestion (optional: for PDF and DOCX uploads)
+pypdf>=3.0.0
+python-docx>=0.8.0
+
+# URL ingestion (web page scraping and content extraction)
+requests>=2.28.0
+beautifulsoup4>=4.12.0
+trafilatura>=1.6.0
+
+# YouTube transcript extraction (no API key required)
+youtube-transcript-api>=1.0.0
+
+# YouTube video download (for visual understanding)
+yt-dlp>=2024.0.0
+
+# File upload support for FastAPI
+python-multipart>=0.0.5
