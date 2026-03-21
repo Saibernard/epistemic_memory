@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  memory-layer:
+    build: .
+    ports:
+      - "8484:8484"
+    volumes:
+      - memory-data:/data
+    environment:
+      - MEMORY_EMBEDDING_MODE=local
+      - MEMORY_DB_PATH=/data/memory.db
+      # Uncomment for OpenAI embeddings:
+      # - MEMORY_EMBEDDING_MODE=openai
+      # - OPENAI_API_KEY=sk-...
+      # Uncomment for Gemini embeddings:
+      # - MEMORY_EMBEDDING_MODE=gemini
+      # - GOOGLE_API_KEY=AIza...
+      # Uncomment for API key auth:
+      # - MEMORY_API_KEY=your-secret-key
+    restart: unless-stopped
+
+volumes:
+  memory-data:
