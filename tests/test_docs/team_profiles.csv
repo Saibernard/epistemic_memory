@@ -1,0 +1,11 @@
+Name,Role,Team,Location,Start Date,Specialty,Fun Fact
+Dr. Amara Okonkwo,CEO & Co-Founder,Executive,Austin,2019-03-14,Post-quantum cryptography,Holds 3 patents in lattice-based encryption
+Rajesh Patel,CTO & Co-Founder,Executive,Austin,2019-03-14,Distributed systems,Built India's first open-source RDBMS in 2012
+Dr. Yuki Tanaka,Principal Engineer,Phoenix,Berlin,2022-06-01,Zero-knowledge proofs,Former research lead at NTT Laboratories
+Marcus Chen,Senior Staff Engineer,Phoenix Backend,Austin,2021-09-15,Systems programming in Rust,Contributor to the Tokio async runtime
+Priya Sharma,Staff Engineer,Phoenix Mobile,Singapore,2023-01-10,Mobile cryptography,Wrote the original CryptoKit wrapper for Swift
+Professor Elena Vasquez,Cryptography Consultant,Phoenix,Zurich (External),2025-01-08,Formal verification,Published 47 papers on provable security
+Tomás Rivera,SRE Lead,Infrastructure,São Paulo,2022-11-20,Kubernetes & observability,Designed Prism observability platform
+Aisha Nakamura,Security Lead,Security,Berlin,2023-04-01,Application security,Discovered CVE-2024-31337 in OpenSSL
+Liam O'Sullivan,Frontend Lead,Platform,Austin,2024-02-15,SolidJS & WebAssembly,Led the React-to-SolidJS migration
+Wei Zhang,ML Engineer,AI/ML,Singapore,2023-08-01,Privacy-preserving ML,Created Nexora-7B-Sec model

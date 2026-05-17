@@ -1,0 +1,81 @@
+{
+  "timestamp": "2026-03-20T22:30:36.857462",
+  "mcp": {
+    "remember": {
+      "latency_ms": 7157.0,
+      "success": true
+    },
+    "recall": {
+      "latency_ms": 262.4,
+      "success": true
+    },
+    "record_episode": {
+      "latency_ms": 95.3,
+      "success": true
+    },
+    "stats": {
+      "latency_ms": 0.4,
+      "success": true
+    },
+    "health": {
+      "latency_ms": 1.7,
+      "success": true
+    },
+    "maintenance": {
+      "latency_ms": 10.8,
+      "success": true
+    },
+    "forget": {
+      "latency_ms": 0.2,
+      "success": true
+    }
+  },
+  "cli_cold": {
+    "remember": {
+      "latency_ms": 7339.9,
+      "success": true
+    },
+    "recall": {
+      "latency_ms": 7094.3,
+      "success": true
+    },
+    "stats": {
+      "latency_ms": 9174.0,
+      "success": true
+    },
+    "health": {
+      "latency_ms": 7793.7,
+      "success": true
+    },
+    "maintenance": {
+      "latency_ms": 8369.5,
+      "success": true
+    },
+    "status": {
+      "latency_ms": 237.6,
+      "success": true
+    }
+  },
+  "cli_warm": {
+    "remember": {
+      "latency_ms": 169.8,
+      "success": true
+    },
+    "recall": {
+      "latency_ms": 151.6,
+      "success": true
+    },
+    "stats": {
+      "latency_ms": 1.7,
+      "success": true
+    },
+    "health": {
+      "latency_ms": 1.4,
+      "success": true
+    },
+    "maintenance": {
+      "latency_ms": 9.7,
+      "success": true
+    }
+  }
+}
