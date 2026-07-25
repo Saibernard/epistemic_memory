@@ -33,8 +33,5 @@ trafilatura>=1.6.0
 # YouTube transcript extraction (no API key required)
 youtube-transcript-api>=1.0.0
 
-# YouTube video download (for visual understanding)
-yt-dlp>=2024.0.0
-
 # File upload support for FastAPI
 python-multipart>=0.0.5

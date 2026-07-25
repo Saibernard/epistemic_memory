@@ -17,8 +17,16 @@ Two entry points, wired via ~/.claude/settings.json:
       compresses episodes into durable semantic facts — so memory
       accumulates with zero manual "remember this" prompts.
 
-Both are best-effort: any failure exits 0 silently.  A memory hook must
-never break a coding session.
+  python3 -m memory_layer.hooks prompt-recall
+      UserPromptSubmit hook.  Semantically recalls memories relevant to
+      the prompt the user JUST typed via the warm daemon (~50ms) and
+      injects them — targeted context, every prompt, not just a static
+      session brief.  Skips silently when the daemon isn't up.
+
+All hooks prefer the warm daemon (millisecond latency) and fall back to
+an in-process MemoryManager where sensible.  Every path is best-effort:
+any failure exits 0 silently — a memory hook must never break a coding
+session.
 """
 
 import hashlib
@@ -110,6 +118,80 @@ def session_start() -> int:
             "additionalContext": "\n".join(lines),
         }
     }))
+
+    # Pre-warm: fire-and-forget daemon spawn so prompt-recall and
+    # record-turn get the millisecond path from the first prompt on.
+    try:
+        from .daemon import ensure_daemon
+        ensure_daemon(wait=False)
+    except Exception:
+        pass
+    return 0
+
+
+# ── UserPromptSubmit: inject memories relevant to THIS prompt ─────────
+
+def prompt_recall() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    prompt = str(payload.get("prompt", "") or "").strip()
+    # Too short to carry meaning, or a slash-command
+    if len(prompt) < 15 or prompt.startswith("/"):
+        return 0
+
+    ns = _derive_project_namespace()
+    try:
+        from .daemon import (
+            MemoryClient, DaemonUnavailable, ensure_daemon, daemon_matches_db,
+        )
+        if not daemon_matches_db(_db_path()):
+            return 0
+        client = MemoryClient()
+        try:
+            rows = client.recall(
+                prompt[:1000], top_k=5, namespace=ns, min_strength=0.05,
+            )
+            if ns != GLOBAL_NAMESPACE:
+                seen = {r.get("memory", {}).get("id") for r in rows}
+                for r in client.recall(
+                    prompt[:1000], top_k=3, namespace=GLOBAL_NAMESPACE,
+                    min_strength=0.05,
+                ):
+                    if r.get("memory", {}).get("id") not in seen:
+                        rows.append(r)
+        except DaemonUnavailable:
+            # Never load the model synchronously here — that would add
+            # seconds to every prompt.  Warm it for next time instead.
+            ensure_daemon(wait=False)
+            return 0
+    except Exception:
+        return 0
+
+    # Keep only genuinely relevant hits — injecting weak matches on
+    # every prompt is noise the model then has to ignore.
+    relevant = [
+        r for r in rows
+        if (r.get("composite_score") or 0) >= 0.35
+    ][:5]
+    if not relevant:
+        return 0
+
+    lines = ["Relevant memories for this request (from Memory Layer):"]
+    for r in relevant:
+        content = (r.get("memory", {}).get("content") or "").strip()
+        if content:
+            lines.append(f"- {content[:280]}")
+    if len(lines) == 1:
+        return 0
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "\n".join(lines),
+        }
+    }))
     return 0
 
 
@@ -168,15 +250,44 @@ def record_turn() -> int:
         return 0
     if not last_assistant.strip():
         return 0
-    # Skip harness-injected pseudo-user content
-    if last_user.lstrip().startswith(("<system-reminder", "<task-notification",
-                                      "<local-command")):
+    # Skip harness-injected pseudo-user content: system reminders, task
+    # notifications, slash-command output, and skill/command instruction
+    # payloads are not things the user said — capturing them poisons
+    # recall with framework text.
+    stripped = last_user.lstrip()
+    if stripped.startswith(("<system-reminder", "<task-notification",
+                            "<local-command", "<command-name",
+                            "#", "Caveat:")):
+        return 0
+    if "<command-name>" in last_user or "<system-reminder>" in last_user:
         return 0
 
     ns = _derive_project_namespace()
+    user_text = last_user.strip()[:MAX_FIELD_CHARS]
+    assistant_text = last_assistant.strip()[:MAX_FIELD_CHARS]
 
-    # Heavy import + model load happen here — this hook runs async in the
-    # background, so session latency is unaffected.
+    # Fast path: warm daemon (~90ms).  Spawns it for next time if down.
+    try:
+        from .daemon import (
+            MemoryClient, DaemonUnavailable, ensure_daemon, daemon_matches_db,
+        )
+        if daemon_matches_db(_db_path()):
+            try:
+                MemoryClient().record_episode(
+                    user_message=user_text,
+                    assistant_response=assistant_text,
+                    importance=0.4,
+                    tags=["auto_captured"],
+                    namespace=ns,
+                )
+                return 0
+            except DaemonUnavailable:
+                ensure_daemon(wait=False)
+    except Exception:
+        pass
+
+    # Fallback: in-process (async hook, so the model load doesn't block
+    # the session — it's just background CPU).
     try:
         import contextlib
         import io
@@ -185,8 +296,8 @@ def record_turn() -> int:
             from memory_layer import MemoryManager
             brain = MemoryManager(db_path=_db_path())
             brain.record_episode(
-                user_message=last_user.strip()[:MAX_FIELD_CHARS],
-                assistant_response=last_assistant.strip()[:MAX_FIELD_CHARS],
+                user_message=user_text,
+                assistant_response=assistant_text,
                 importance=0.4,
                 tags=["auto_captured"],
                 namespace=ns,
@@ -203,7 +314,10 @@ def main() -> int:
         return session_start()
     if cmd == "record-turn":
         return record_turn()
-    print("usage: python3 -m memory_layer.hooks {session-start|record-turn}",
+    if cmd == "prompt-recall":
+        return prompt_recall()
+    print("usage: python3 -m memory_layer.hooks "
+          "{session-start|record-turn|prompt-recall}",
           file=sys.stderr)
     return 2
 

@@ -247,7 +247,12 @@ class EnrichmentPipeline:
                 except Exception:
                     pass
 
-        if backend in ("auto", "gemini", "regex"):
+        # Cloud backends require EXPLICIT opt-in — never "auto".
+        # Auto-escalating to a paid remote LLM just because an API key
+        # exists in the environment silently added ~1.2s of network
+        # latency and per-call cost to every store, and violates the
+        # local-first / zero-cost default this system promises.
+        if backend == "gemini":
             google_key = os.environ.get("GOOGLE_API_KEY", "")
             if google_key:
                 gemini_model = os.environ.get(

@@ -178,9 +178,25 @@ def _identifier_conflict(new_content: str, old_content: str) -> bool:
     union = rest_new | rest_old
     rest_jaccard = len(rest_new & rest_old) / len(union) if union else 1.0
 
+    def _subject_position(toks: list, ids: set) -> bool:
+        # An identifier among the first two tokens names the SUBJECT of
+        # the sentence ("User0042 works as...", "Ticket T-1468: ...").
+        return any(t in ids for t in toks[:2])
+
     if rest_jaccard >= 0.9:
-        # Same template, only numbers changed
-        return len(diff_new) >= 2 and len(diff_old) >= 2
+        # Same template, only numbers changed.  Distinct facts when:
+        #  - several numbers changed ("Note 3 ... T-1003" vs "Note 0 ...
+        #    T-1000"), or
+        #  - the changed number IS the subject ("User0041 works as a
+        #    chef" vs "User0042 works as a chef" — different entities).
+        # Otherwise it's a pure value update ("uses Postgres 15" → "uses
+        # Postgres 16").
+        if len(diff_new) >= 2 and len(diff_old) >= 2:
+            return True
+        return (
+            _subject_position(tok_new, diff_new)
+            and _subject_position(tok_old, diff_old)
+        )
 
     def _preceders(toks: list, ids: set) -> set:
         return {
@@ -189,7 +205,13 @@ def _identifier_conflict(new_content: str, old_content: str) -> bool:
             if t in ids and i > 0
         }
 
-    return bool(_preceders(tok_new, diff_new) & _preceders(tok_old, diff_old))
+    if _preceders(tok_new, diff_new) & _preceders(tok_old, diff_old):
+        return True
+    # Subject-position conflict blocks regardless of template similarity
+    return (
+        _subject_position(tok_new, diff_new)
+        and _subject_position(tok_old, diff_old)
+    )
 
 
 # --- Recall composite weights ---
@@ -1574,22 +1596,12 @@ class MemoryManager:
         Uses the enrichment LLM if available, otherwise falls back to
         simple synonym / rewrite heuristics.
         """
+        # The recall hot path must NEVER block on an LLM call: a network
+        # or local-LLM round-trip per recall (measured ~1.2s via cloud)
+        # dwarfs the entire retrieval pipeline (~50ms).  Heuristic
+        # expansion only — this also keeps recall deterministic and $0.
         alternatives = [query]
-
-        if self.enrichment.has_llm:
-            try:
-                prompt = self._QUERY_EXPAND_PROMPT.format(query=query)
-                raw = self.enrichment.generate(prompt, max_tokens=150)
-                for line in raw.strip().split("\n"):
-                    line = line.strip().lstrip("0123456789.-) ")
-                    if line and len(line) > 5 and line != query:
-                        alternatives.append(line)
-            except Exception:
-                pass
-
-        if len(alternatives) < 2:
-            alternatives.extend(self._heuristic_expand(query))
-
+        alternatives.extend(self._heuristic_expand(query))
         return alternatives[:4]
 
     @staticmethod
@@ -1809,7 +1821,78 @@ class MemoryManager:
             self.storage.store_link(causal_link)
 
         self._last_episode_id = episode.id
+
+        # Distill durable facts from the turn (local LLM only, best-effort).
+        # Raw episodes fade fast by design; the *decisions* discovered in a
+        # turn deserve semantic memories that persist.
+        try:
+            self._distill_episode(
+                user_message, assistant_response, namespace, episode.id,
+            )
+        except Exception:
+            pass
+
         return episode
+
+    _DISTILL_PROMPT = (
+        "From this coding-assistant interaction, extract up to 3 atomic, "
+        "durable facts worth remembering across future sessions: lasting "
+        "decisions, preferences, project facts, or discovered constraints. "
+        "Do NOT include transient task chatter. One fact per line, plain "
+        "text, no numbering. If nothing is durable, reply exactly NONE.\n\n"
+        "User: {user}\nAssistant: {assistant}\n\nDurable facts:"
+    )
+
+    def _distill_episode(
+        self,
+        user_message: str,
+        assistant_response: str,
+        namespace: str,
+        episode_id: str,
+    ) -> List[Memory]:
+        """Turn a raw captured episode into 0-3 atomic semantic facts.
+
+        Only runs when a (local) enrichment LLM is configured — the raw
+        episode is always stored regardless, so this is purely additive
+        signal, never a dependency.
+        """
+        if not self.enrichment.has_llm:
+            return []
+
+        prompt = self._DISTILL_PROMPT.format(
+            user=user_message[:1500], assistant=assistant_response[:1500],
+        )
+        raw = self.enrichment.generate(prompt, max_tokens=200)
+        if not raw or raw.strip().upper().startswith("NONE"):
+            return []
+
+        facts: List[Memory] = []
+        for line in raw.strip().split("\n"):
+            line = line.strip().lstrip("0123456789.-*) ").strip()
+            if len(line) < 15 or len(line) > 400:
+                continue
+            fact = self.remember(
+                content=line,
+                memory_type=MemoryType.SEMANTIC,
+                importance=0.6,
+                tags=["distilled"],
+                metadata={"distilled_from": episode_id},
+                namespace=namespace,
+            )
+            fact = fact[0] if isinstance(fact, list) else fact
+            try:
+                self.storage.store_link(MemoryLink(
+                    source_id=episode_id,
+                    target_id=fact.id,
+                    link_type=LinkType.DERIVED,
+                    weight=0.8,
+                ))
+            except Exception:
+                pass
+            facts.append(fact)
+            if len(facts) >= 3:
+                break
+        return facts
 
     def learn_procedure(
         self,

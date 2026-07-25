@@ -119,6 +119,69 @@ def get_brain():
     return brain
 
 
+# ── Warm-daemon thin-client routing ───────────────────────────────────
+# One long-lived daemon holds the model + FAISS hot; this process then
+# serves the hot tools over localhost HTTP in ~10-90ms instead of
+# loading its own model.  Any failure falls back to the in-process
+# brain, so behaviour is identical — just slower — without the daemon.
+
+_client = None          # cached MemoryClient once verified up
+_daemon_checked = False
+
+
+def get_client():
+    """Return a live MemoryClient, or None to use the in-process brain."""
+    global _client, _daemon_checked
+    if os.environ.get("MEMORY_NO_DAEMON", "0") in ("1", "true", "yes"):
+        return None
+    if _client is not None:
+        return _client
+    try:
+        from memory_layer.daemon import (
+            MemoryClient, ensure_daemon, daemon_matches_db,
+        )
+        # Never route to a daemon serving a different database
+        if not daemon_matches_db(DB_PATH):
+            return None
+        if not _daemon_checked:
+            _daemon_checked = True
+            # Fire-and-forget spawn; warm path kicks in once it's up
+            ensure_daemon(wait=False)
+        c = MemoryClient()
+        if c.is_up():
+            _client = c
+            trace("daemon client active")
+            return _client
+    except Exception:
+        pass
+    return None
+
+
+class _Obj:
+    """Attribute-access wrapper so daemon JSON flows through the same
+    formatting code as in-process pydantic objects."""
+
+    def __init__(self, d):
+        self._d = d or {}
+
+    def __getattr__(self, name):
+        v = self._d.get(name)
+        if isinstance(v, dict):
+            return _Obj(v)
+        return v
+
+
+def _wrap_recall(rows):
+    out = []
+    for r in rows:
+        o = _Obj(r)
+        # normalise: metadata may be absent in serialized form
+        if isinstance(r.get("memory"), dict) and r["memory"].get("metadata") is None:
+            r["memory"]["metadata"] = {}
+        out.append(o)
+    return out
+
+
 # ══════════════════════════════════════════
 #  STDIO TRANSPORT — newline-delimited JSON
 # ══════════════════════════════════════════
@@ -289,8 +352,6 @@ def _parse_tags(args):
 
 
 def handle_tool(name, args):
-    from memory_layer import MemoryType
-    b = get_brain()
     # Default namespace = this project (derived from cwd at launch)
     ns = str(args.get("namespace", PROJECT_NAMESPACE)).strip() or PROJECT_NAMESPACE
 
@@ -307,13 +368,32 @@ def handle_tool(name, args):
         if str(args.get("scope", "project")).strip().lower() == "global":
             ns = GLOBAL_NAMESPACE
 
-        m = b.remember(content=content, memory_type=MemoryType.SEMANTIC,
-                       importance=importance, tags=tags, namespace=ns)
+        c = get_client()
+        if c is not None:
+            try:
+                m = _Obj(c.remember(content=content, importance=importance,
+                                    tags=tags, namespace=ns))
+            except Exception:
+                m = None
+        else:
+            m = None
+        if m is None:
+            from memory_layer import MemoryType
+            m = get_brain().remember(
+                content=content, memory_type=MemoryType.SEMANTIC,
+                importance=importance, tags=tags, namespace=ns,
+            )
+        meta = m.metadata
+        if isinstance(meta, _Obj):
+            meta = meta._d
+        meta = meta or {}
         r = f'Remembered: "{content}" (importance={m.importance:.2f})'
-        if m.metadata.get("replaces"):
-            r += f"\nAuto-updated: replaced {len(m.metadata['replaces'])} outdated memory(ies) with this new version."
-        if m.metadata.get("contradicts"):
-            r += f"\nNote: conflicts with {len(m.metadata['contradicts'])} existing memory(ies)."
+        if meta.get("replaces"):
+            r += (f"\nAuto-updated: replaced {len(meta['replaces'])} "
+                  "outdated memory(ies) with this new version.")
+        if meta.get("contradicts"):
+            r += (f"\nNote: conflicts with {len(meta['contradicts'])} "
+                  "existing memory(ies).")
         return r
 
     elif name == "memory_recall":
@@ -330,22 +410,35 @@ def handle_tool(name, args):
         diversity = bool(args.get("diversity", False))
 
         effective_top_k = top_k * 3 if diversity else top_k
-        results = b.recall(query, top_k=effective_top_k, min_strength=0.05,
-                           tags=recall_tags, namespace=ns,
-                           reasoning=reasoning, include_history=include_history)
+
+        def _do_recall(namespace, use_reasoning):
+            """Warm-daemon recall with in-process fallback."""
+            c = get_client()
+            if c is not None and not use_reasoning:
+                try:
+                    return _wrap_recall(c.recall(
+                        query, top_k=effective_top_k, namespace=namespace,
+                        min_strength=0.05, tags=recall_tags,
+                        include_history=include_history,
+                    ))
+                except Exception:
+                    pass
+            return get_brain().recall(
+                query, top_k=effective_top_k, min_strength=0.05,
+                tags=recall_tags, namespace=namespace,
+                reasoning=use_reasoning, include_history=include_history,
+            )
+
+        results = _do_recall(ns, reasoning)
 
         # Merge shared user-level (global) memories unless disabled or
         # we're already searching the global namespace.
         include_global = bool(args.get("include_global", True))
         if include_global and ns != GLOBAL_NAMESPACE:
             try:
-                global_results = b.recall(
-                    query, top_k=effective_top_k, min_strength=0.05,
-                    tags=recall_tags, namespace=GLOBAL_NAMESPACE,
-                    reasoning=False, include_history=include_history,
-                )
+                global_results = _do_recall(GLOBAL_NAMESPACE, False)
                 seen_ids = {r.memory.id for r in results}
-                merged = results + [
+                merged = list(results) + [
                     r for r in global_results if r.memory.id not in seen_ids
                 ]
                 merged.sort(key=lambda r: r.composite_score, reverse=True)
@@ -404,7 +497,7 @@ def handle_tool(name, args):
         if not memory_id:
             raise ValueError("memory_id is required")
         hard = bool(args.get("hard_delete", False))
-        ok = b.forget_memory(memory_id, hard=hard)
+        ok = get_brain().forget_memory(memory_id, hard=hard)
         if not ok:
             return f"Memory not found: {memory_id}"
         action = "permanently deleted" if hard else "deactivated"
@@ -419,7 +512,18 @@ def handle_tool(name, args):
         tags = _parse_tags(args) + ["episode"]
         user_msg = str(args.get("user_message", summary)).strip()
         assistant_msg = str(args.get("assistant_response", "")).strip()
-        b.record_episode(
+        c = get_client()
+        if c is not None:
+            try:
+                c.record_episode(
+                    user_message=user_msg,
+                    assistant_response=assistant_msg or summary,
+                    importance=0.6, tags=tags, namespace=ns,
+                )
+                return "Episode recorded."
+            except Exception:
+                pass
+        get_brain().record_episode(
             user_message=user_msg,
             assistant_response=assistant_msg or summary,
             importance=0.6,
@@ -429,7 +533,7 @@ def handle_tool(name, args):
         return "Episode recorded."
 
     elif name == "memory_stats":
-        s = b.get_stats()
+        s = get_brain().get_stats()
         return (
             f"Total: {s.total_memories} ({s.episodic_count} episodic, "
             f"{s.semantic_count} semantic, {s.procedural_count} procedural) "
@@ -456,7 +560,7 @@ def handle_tool(name, args):
 
         memory_ids = []
         for chunk in chunks:
-            m = b.remember(
+            m = get_brain().remember(
                 content=chunk["content"],
                 memory_type=MemoryType.SEMANTIC,
                 importance=importance,
@@ -493,7 +597,7 @@ def handle_tool(name, args):
 
         memory_ids = []
         for chunk in chunks:
-            m = b.remember(
+            m = get_brain().remember(
                 content=chunk["content"],
                 memory_type=MemoryType.SEMANTIC,
                 importance=importance,
@@ -513,7 +617,7 @@ def handle_tool(name, args):
         )
 
     elif name == "memory_health":
-        report = b.health_check()
+        report = get_brain().health_check()
         status = report.get("status", "unknown")
         db = report.get("database", {})
         issues = report.get("issues", [])
@@ -528,7 +632,7 @@ def handle_tool(name, args):
         return out
 
     elif name == "memory_maintenance":
-        results = b.maintenance()
+        results = get_brain().maintenance()
         pruned = results.get("reasoning_pruned", 0)
         cleaned = results.get("queue_cleaned", 0)
         rebuilt = results.get("faiss_rebuilt", False)
@@ -543,7 +647,7 @@ def handle_tool(name, args):
         )
 
     elif name == "memory_backup":
-        path = b.backup()
+        path = get_brain().backup()
         return f"Backup created: {path}"
 
     elif name == "memory_synthesize":
@@ -551,7 +655,7 @@ def handle_tool(name, args):
         if not topic:
             raise ValueError("topic is required")
         store = bool(args.get("store_result", False))
-        result = b.synthesize(topic=topic, store_result=store, namespace=ns)
+        result = get_brain().synthesize(topic=topic, store_result=store, namespace=ns)
         out = f"Synthesis for '{topic}':\n\n{result['synthesis']}\n\nSources: {result['source_count']} memories"
         if result.get("stored_memory_id"):
             out += f"\nStored as memory: {result['stored_memory_id'][:8]}"

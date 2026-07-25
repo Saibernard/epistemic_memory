@@ -83,6 +83,28 @@ Everything runs locally (SQLite + FAISS + a local embedding model): no API
 key, no network, no per-call cost. Override the namespace explicitly with
 `MEMORY_NAMESPACE=<name>` if you want several folders to share one memory.
 
+**Warm daemon (automatic).** The first memory operation auto-starts a
+single background daemon (`memory-layer serve` on 127.0.0.1) that keeps
+the embedding model and FAISS index hot. Every MCP call and hook then
+completes in ~40–90ms instead of paying a multi-second model load per
+process — and there is exactly one writer for the index. If the daemon
+isn't running, every entry point transparently falls back to in-process
+mode. Disable with `MEMORY_NO_DAEMON=1`.
+
+**Automatic memory with Claude Code hooks.** Three lifecycle hooks make
+memory fully automatic (see `memory_layer/hooks.py`):
+
+| Hook | Event | What it does |
+|---|---|---|
+| `session-start` | SessionStart | Injects a brief of this project's + global memories (sub-second, SQLite-direct) |
+| `prompt-recall` | UserPromptSubmit | Semantically recalls memories relevant to the prompt you just typed (~50ms via daemon) |
+| `record-turn` | Stop (async) | Captures what was asked and done as an episode; consolidation later distills durable facts |
+
+If a local LLM is available via Ollama (`ollama serve`), captured turns
+are additionally distilled into atomic semantic facts — still local,
+still $0. Cloud LLM backends are never used unless explicitly opted in
+(`MEMORY_ENRICHMENT_BACKEND=gemini`).
+
 ### Use as a REST API
 
 ```bash
