@@ -6,6 +6,10 @@ import pytest
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Tests explicitly opt in to hash-embedding fallback so the suite runs in
+# sandboxes without the model download.  Production fails hard instead of
+# silently poisoning the store (see embeddings.py).
+os.environ.setdefault("MEMORY_ALLOW_HASH_FALLBACK", "1")
 
 
 @pytest.fixture

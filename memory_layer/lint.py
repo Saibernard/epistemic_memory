@@ -178,7 +178,11 @@ class MemoryLinter:
         """Find active memory pairs with very high cosine similarity (>0.95)."""
         issues = []
         try:
-            pairs = self.storage.get_memories_with_embeddings(min_strength=0.0)
+            # current_only: a superseded memory legitimately near-duplicates
+            # its successor — flagging that pair would be a false positive.
+            pairs = self.storage.get_memories_with_embeddings(
+                min_strength=0.0, current_only=True
+            )
         except Exception:
             return issues
 

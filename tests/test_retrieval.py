@@ -33,17 +33,26 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DOCS_DIR = os.path.join(SCRIPT_DIR, "test_docs")
 
-# Auto-load .env from project root so API keys persist across runs
-_env_path = os.path.join(PROJECT_ROOT, ".env")
-if os.path.isfile(_env_path):
-    with open(_env_path) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _key, _, _val = _line.partition("=")
-                _key, _val = _key.strip(), _val.strip().strip("\"'")
-                if _key and _val and _key not in os.environ:
-                    os.environ[_key] = _val
+def _load_env_for_script_run():
+    """
+    Load .env from the project root — ONLY when run as a script.
+
+    This must never run at import time: pytest imports this module during
+    collection, and injecting real API keys into os.environ silently
+    switched every subsequent test's enrichment backend to a live LLM,
+    making the whole suite nondeterministic (the long-standing
+    test_dedup_returns_existing flake).
+    """
+    _env_path = os.path.join(PROJECT_ROOT, ".env")
+    if os.path.isfile(_env_path):
+        with open(_env_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _key, _, _val = _line.partition("=")
+                    _key, _val = _key.strip(), _val.strip().strip("\"'")
+                    if _key and _val and _key not in os.environ:
+                        os.environ[_key] = _val
 
 # Each test: (query, list_of_expected_substrings — ALL must be found in top-5 results)
 RETRIEVAL_TESTS = [
@@ -356,4 +365,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _load_env_for_script_run()
     sys.exit(main())

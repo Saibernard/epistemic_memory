@@ -51,7 +51,12 @@ class PredictiveCache:
         manager: "MemoryManager",
         ttl: float = 300.0,
         similarity_threshold: float = 0.75,
-        enabled: bool = True,
+        enabled: bool = False,
+        # Disabled by default: injecting similarity-to-a-*predicted*-query
+        # as the dominant semantic score inflates rankings, the real FAISS
+        # search runs unconditionally anyway (no speedup at local
+        # latencies), and the per-recall prefetch thread raced with
+        # foreground FAISS mutation.  Opt in via MEMORY_PREDICTIVE_CACHE=1.
     ):
         self.manager = manager
         self.ttl = ttl

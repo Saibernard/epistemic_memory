@@ -457,6 +457,7 @@ class DynamoStorage:
         memory_type: Optional[MemoryType] = None,
         min_strength: float = 0.0,
         namespace: Optional[str] = None,
+        current_only: bool = False,
     ) -> List[Tuple[Memory, np.ndarray]]:
         memories = self.get_all_memories(
             memory_type=memory_type,
@@ -465,6 +466,8 @@ class DynamoStorage:
         )
         results = []
         for mem in memories:
+            if current_only and not mem.is_current:
+                continue
             if mem.embedding and mem.strength >= min_strength:
                 emb = np.array(mem.embedding, dtype=np.float32)
                 results.append((mem, emb))

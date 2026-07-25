@@ -96,7 +96,14 @@ def _load_dotenv() -> None:
                     os.environ[key] = val
             break
 
-_load_dotenv()
+# NOTE: _load_dotenv() is deliberately NOT called at import time.
+# Mutating os.environ as an import side effect made unit tests silently
+# pick up real API keys (live LLM calls from tests, nondeterministic
+# behaviour).  CLI/server entry points that want .env support call
+# load_dotenv() explicitly.
+def load_dotenv() -> None:
+    """Explicitly load a .env file (CLI/server entry points only)."""
+    _load_dotenv()
 
 
 # ══════════════════════════════════════════════
@@ -131,6 +138,59 @@ def _scale_sim_threshold(base: float, dim: int) -> float:
         return base
     offset = min(0.12, 0.04 * (dim / 768 - 1))
     return min(0.97, base + offset)
+
+
+def _identifier_conflict(new_content: str, old_content: str) -> bool:
+    """
+    Detect two *distinct* templated facts that must not supersede each other.
+
+    Identifier tokens (anything containing a digit — ticket numbers, IDs,
+    versions, dates) present on BOTH sides but sharing NONE may signal
+    different subjects ("ticket T-1468" vs "ticket T-1469") — or a genuine
+    value update ("Postgres 15" → "Postgres 16", "deadline March 3rd" →
+    "deadline April 7th").  Disambiguation:
+
+      • Identical non-identifier template: exactly ONE changed number per
+        side is a value update (allow); several changed numbers are
+        different *instances* of the same template (block).
+      • Otherwise: if a conflicting identifier is preceded by the SAME
+        head word on both sides ("ticket 12" vs "ticket 13"), the number
+        distinguishes instances of one kind of thing → distinct facts
+        (block).  Different preceders ("March 3rd" vs "April 7th") read
+        as a changed value → update (allow).
+
+    Returns True when supersession/contradiction should be blocked.
+    """
+    tok_new = re.findall(r"[a-z0-9_]+", new_content.lower())
+    tok_old = re.findall(r"[a-z0-9_]+", old_content.lower())
+    ids_new = {t for t in tok_new if any(c.isdigit() for c in t)}
+    ids_old = {t for t in tok_old if any(c.isdigit() for c in t)}
+    # Conflict signal = identifiers each side has that the other lacks.
+    # (A shared id like "option 0" on both sides must not mask a
+    # conflicting one like T-1000 vs T-1004.)
+    diff_new = ids_new - ids_old
+    diff_old = ids_old - ids_new
+    if not diff_new or not diff_old:
+        return False  # no identifier signal, or identifiers agree
+
+    rest_new = set(tok_new) - ids_new
+    rest_old = set(tok_old) - ids_old
+    union = rest_new | rest_old
+    rest_jaccard = len(rest_new & rest_old) / len(union) if union else 1.0
+
+    if rest_jaccard >= 0.9:
+        # Same template, only numbers changed
+        return len(diff_new) >= 2 and len(diff_old) >= 2
+
+    def _preceders(toks: list, ids: set) -> set:
+        return {
+            toks[i - 1]
+            for i, t in enumerate(toks)
+            if t in ids and i > 0
+        }
+
+    return bool(_preceders(tok_new, diff_new) & _preceders(tok_old, diff_old))
+
 
 # --- Recall composite weights ---
 # Semantic (embedding cosine sim) is the primary retrieval signal.
@@ -286,7 +346,11 @@ class MemoryManager:
             trigger_interval=100,
         )
         self.graph_reasoner = GraphReasoner(manager=self)
-        self.predictive_cache = PredictiveCache(manager=self)
+        self.predictive_cache = PredictiveCache(
+            manager=self,
+            enabled=os.environ.get("MEMORY_PREDICTIVE_CACHE", "0")
+            in ("1", "true", "yes"),
+        )
         self.reasoning = ReasoningEngine(
             manager=self,
             mode=reasoning_engine,
@@ -320,6 +384,7 @@ class MemoryManager:
         self.default_namespace = default_namespace
 
         self._operation_count = 0
+        self._last_index_save_ops = -1   # dedupe periodic index saves
         self._lock = threading.Lock()
         self._bg_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="memory_bg")
         self._shutting_down = False
@@ -473,6 +538,11 @@ class MemoryManager:
             fact_meta["llm_extracted"] = True
             fact_meta["original_content_preview"] = original_content[:200]
 
+            # Formation priors — extracted facts are not default-0.5
+            fact_conf, fact_status = self._compute_initial_confidence(
+                fact["content"], fact_meta, memory_type,
+            )
+
             memory = Memory(
                 memory_type=memory_type,
                 content=fact["content"],
@@ -482,6 +552,8 @@ class MemoryManager:
                 strength=1.0,
                 access_count=0,
                 namespace=namespace,
+                confidence=fact_conf,
+                epistemic_status=fact_status,
                 document_date=now,
                 event_dates=llm_event_dates if llm_event_dates else None,
             )
@@ -489,17 +561,43 @@ class MemoryManager:
 
         embeddings = self.embeddings.embed_batch(fact_contents)
 
+        # The extraction path previously bypassed dedup and supersession
+        # entirely — re-ingesting a conversation duplicated every fact and
+        # updates arriving via extraction never superseded stale facts.
+        stored: List[Memory] = []
         for memory, emb in zip(memories, embeddings):
             memory.embedding = emb
+            candidates = self._get_faiss_candidates(
+                emb, namespace=memory.namespace,
+            )
+
+            # Dedup: identical fact already stored → reinforce, don't dupe
+            existing = self.graph.check_duplicate(
+                memory.content, candidates, emb,
+            )
+            if existing:
+                existing = self.decay_engine.reinforce(existing, boost=0.1)
+                self.storage.update_memory(existing)
+                self.storage.link_memory_to_chunk(existing.id, source_chunk_id)
+                stored.append(existing)
+                continue
+
             self.storage.store_memory(memory)
             self.memory_index.add(memory.id, emb)
             # Phase 1B: Link each memory to its source chunk
             self.storage.link_memory_to_chunk(memory.id, source_chunk_id)
+            stored.append(memory)
 
+            # Supersession: an extracted update replaces its stale prior
+            self._apply_batch_supersessions(memory, candidates)
+
+        memories = stored
         self.memory_index.save()
 
         for memory in memories:
-            candidates = self._get_faiss_candidates(memory.embedding)
+            candidates = self._get_faiss_candidates(
+                memory.embedding, namespace=memory.namespace,
+            )
             self.graph.create_associations(memory, candidates)
             entity_text = memory.content
             self.entity_graph.index_memory(memory.id, entity_text)
@@ -512,6 +610,78 @@ class MemoryManager:
         self._invalidate_contradiction_cache()
         self._increment_operations()
         return memories[0]
+
+    def _apply_batch_supersessions(
+        self, memory: Memory, candidates: List[Tuple[Memory, np.ndarray]],
+    ) -> List[str]:
+        """
+        Compact supersession pass for the batch (LLM-extraction) store path.
+
+        Mirrors the single-store path's update semantics: a sufficiently
+        similar prior fact is snapshotted, marked non-current/contradicted,
+        removed from the primary index, and linked with a SUPERSEDED edge.
+        Applies the same distinct-fact identifier guard.
+        """
+        content = memory.content
+        dim = self.embeddings.dimension
+        contradict_base = _scale_sim_threshold(_BASE_CONTRADICT_THRESHOLD, dim)
+        st_default = _scale_sim_threshold(_BASE_SIM_THRESHOLDS["default"], dim)
+
+        pairs = self.graph.find_contradictions(
+            memory, candidates, base_threshold=contradict_base,
+        )
+        if not pairs:
+            return []
+
+        new_tokens = set(re.findall(r"[a-z0-9_]+", content.lower()))
+        now = time.time()
+        superseded_ids: List[str] = []
+        for old_mem, sim in pairs:
+            if old_mem.id == memory.id or not old_mem.is_current:
+                continue
+            old_tokens = set(
+                re.findall(r"[a-z0-9_]+", old_mem.content.lower())
+            )
+            if _identifier_conflict(content, old_mem.content):
+                continue
+            union = new_tokens | old_tokens
+            overlap = len(new_tokens & old_tokens) / len(union) if union else 0
+            is_update = (
+                (overlap >= 0.4 and len(content) < 120)
+                or (overlap >= 0.5 and len(content) < 500)
+                or sim >= st_default
+            )
+            if not is_update:
+                continue
+
+            self._snapshot_version(old_mem, reason="superseded")
+            old_mem.metadata["superseded_by"] = memory.id
+            old_mem.metadata["valid_until"] = now
+            if not old_mem.metadata.get("valid_from"):
+                old_mem.metadata["valid_from"] = old_mem.created_at
+            old_mem.strength = 0.3
+            old_mem.is_active = True
+            old_mem.is_current = False
+            old_mem.epistemic_status = "contradicted"
+            old_mem.confidence = round(min(old_mem.confidence, 0.3), 3)
+            self.storage.update_memory(old_mem)
+            try:
+                self.memory_index.remove(old_mem.id)
+            except Exception:
+                pass
+            self.storage.store_link(MemoryLink(
+                source_id=old_mem.id,
+                target_id=memory.id,
+                link_type=LinkType.SUPERSEDED,
+                weight=1.0,
+            ))
+            superseded_ids.append(old_mem.id)
+
+        if superseded_ids:
+            memory.metadata["replaces"] = superseded_ids
+            memory.tags = list(set(memory.tags + ["updated"]))
+            self.storage.update_memory(memory)
+        return superseded_ids
 
     def _store_extracted_relationships(
         self,
@@ -612,8 +782,12 @@ class MemoryManager:
             embed_text = enriched if enriched else content
             memory.embedding = self.embeddings.embed(embed_text)
 
-        # Use FAISS to narrow candidates instead of full table scan
-        candidates = self._get_faiss_candidates(memory.embedding)
+        # Use FAISS to narrow candidates instead of full table scan.
+        # Namespace-scoped: dedup/supersession/contradiction must never
+        # act on (or mutate) another namespace's memories.
+        candidates = self._get_faiss_candidates(
+            memory.embedding, namespace=memory.namespace,
+        )
 
         # Dedup: if an identical memory already exists, reinforce it instead
         existing = self.graph.check_duplicate(content, candidates, memory.embedding)
@@ -650,6 +824,12 @@ class MemoryManager:
                 union = new_tokens | old_tokens
                 jaccard = len(new_tokens & old_tokens) / len(union) if union else 0
                 if jaccard >= min_jaccard and new_tokens != old_tokens:
+                    # Distinct-fact guard: templated-but-different facts
+                    # (e.g. "ticket T-1468" vs "ticket T-1469") share many
+                    # structure words but conflict on identifiers — they are
+                    # NOT updates of each other.
+                    if _identifier_conflict(content, cand_mem.content):
+                        continue
                     emb = np.array(cand_emb, dtype=np.float32)
                     q = np.array(memory.embedding, dtype=np.float32)
                     sim = float(np.dot(q, emb) / (np.linalg.norm(q) * np.linalg.norm(emb) + 1e-9))
@@ -670,6 +850,14 @@ class MemoryManager:
             old_tokens = set(re.findall(r"[a-z0-9_]+", old_mem.content.lower()))
             union = new_tokens | old_tokens
             overlap = len(new_tokens & old_tokens) / len(union) if union else 0
+
+            # Distinct-fact guard: two templated facts with conflicting
+            # identifiers (different tickets, versions of *different*
+            # subjects, etc.) are separate facts, not an update — even at
+            # very high cosine similarity.  Skip entirely: neither
+            # supersession nor a contradiction link is appropriate.
+            if _identifier_conflict(content, old_mem.content):
+                continue
 
             is_update = (
                 (overlap >= 0.4 and len(content) < 120)
@@ -981,8 +1169,11 @@ class MemoryManager:
             for eq in expanded_queries:
                 fts_hits = self.storage.fts_search(eq, limit=candidate_k)
                 for mid, bm25_score in fts_hits:
-                    normalized = max(0.0, 1.0 + bm25_score * 0.1)
-                    fts_boost[mid] = max(fts_boost.get(mid, 0.0), min(1.0, normalized))
+                    # SQLite FTS5 bm25() is *more negative = better match*.
+                    # Map [-10, 0] → [1.0, 0.0] so a strong lexical match
+                    # gets the LARGEST boost (previously inverted).
+                    normalized = min(1.0, max(0.0, -bm25_score / 10.0))
+                    fts_boost[mid] = max(fts_boost.get(mid, 0.0), normalized)
                     if mid not in candidate_ids:
                         candidate_ids[mid] = 0.0
 
@@ -1200,7 +1391,12 @@ class MemoryManager:
                 associated = self.graph.get_associated_memories(
                     memory.id, depth=2, max_results=3
                 )
-                associations = [m.id for m, w in associated]
+                # Namespace guard: legacy links may cross namespaces —
+                # never leak another namespace's memory IDs into results.
+                associations = [
+                    m.id for m, w in associated
+                    if m.namespace == memory.namespace
+                ]
 
             recall_results.append(RecallResult(
                 memory=memory,
@@ -1212,9 +1408,17 @@ class MemoryManager:
                 associations=associations,
             ))
 
-        if self._operation_count % 25 == 0:
+        # Persist indices only when store operations have advanced the
+        # counter.  (Previously `% 25 == 0` stayed true across every
+        # recall after any store-multiple-of-25, serialising both index
+        # files to disk on each recall in read-heavy workloads.)
+        if (
+            self._operation_count != self._last_index_save_ops
+            and self._operation_count % 25 == 0
+        ):
             self.memory_index.save()
             self.passage_index.save()
+            self._last_index_save_ops = self._operation_count
 
         # Phase 3B: Trigger predictive pre-fetching for next query
         if recall_results:
@@ -1683,17 +1887,44 @@ class MemoryManager:
         # Set high confidence on corrections (user-verified)
         new_memory.confidence = 0.9
         new_memory.epistemic_status = "verified"
+
+        # Edge case: if new_content near-duplicates the old content,
+        # remember()'s dedup returns the OLD memory itself.  That is a
+        # re-affirmation, not a contradiction — verify it, never mark a
+        # memory as superseded by itself (which used to destroy it).
+        if new_memory.id == memory_id:
+            new_memory.is_current = True
+            new_memory.metadata.pop("superseded_by", None)
+            new_memory.metadata.pop("valid_until", None)
+            new_memory.metadata["verified_at"] = now
+            self.storage.update_memory(new_memory)
+            self._invalidate_contradiction_cache()
+            return new_memory
+
         self.storage.update_memory(new_memory)
+
+        # Re-read the old memory: remember() may have already auto-
+        # superseded it, and writing back the stale pre-store copy would
+        # resurrect it as current.
+        old_memory = self.storage.get_memory(memory_id) or old_memory
 
         old_memory.metadata["superseded_by"] = new_memory.id
         old_memory.metadata["valid_until"] = now
         if not old_memory.metadata.get("valid_from"):
             old_memory.metadata["valid_from"] = old_memory.created_at
         old_memory.strength = max(0.2, old_memory.strength * 0.5)
+        old_memory.is_current = False   # corrected-away → non-current
         # Epistemic: the corrected-away memory is now contradicted
         old_memory.epistemic_status = "contradicted"
         old_memory.confidence = round(min(old_memory.confidence, 0.3), 3)
         self.storage.update_memory(old_memory)
+
+        # Keep the FAISS invariant: non-current memories leave the
+        # primary index (they remain queryable in SQLite for history).
+        try:
+            self.memory_index.remove(memory_id)
+        except Exception:
+            pass
 
         link = MemoryLink(
             source_id=memory_id,
@@ -1777,9 +2008,14 @@ class MemoryManager:
         return stats
 
     def _index_unindexed_memories(self):
-        """Add any memories missing from FAISS/entity graph (e.g. after consolidation)."""
+        """Add any memories missing from FAISS/entity graph (e.g. after consolidation).
+
+        current_only: superseded memories were deliberately removed from the
+        primary index — re-adding them here would let dead facts hijack
+        dedup and contradiction checks.
+        """
         indexed_ids = set(self.memory_index._id_to_idx.keys()) if hasattr(self.memory_index, '_id_to_idx') else set()
-        for mem, emb in self.storage.get_memories_with_embeddings():
+        for mem, emb in self.storage.get_memories_with_embeddings(current_only=True):
             if mem.id not in indexed_ids:
                 self.memory_index.add(mem.id, mem.embedding)
                 self.entity_graph.index_memory(mem.id, mem.content)
@@ -2201,13 +2437,23 @@ class MemoryManager:
     # ══════════════════════════════════════════════
 
     def _get_faiss_candidates(
-        self, embedding: List[float], k: int = GRAPH_CANDIDATE_K,
+        self,
+        embedding: List[float],
+        k: int = GRAPH_CANDIDATE_K,
+        namespace: Optional[str] = None,
     ) -> List[Tuple[Memory, np.ndarray]]:
         """
         Use FAISS to retrieve the top-k most similar memories and return
         them as (Memory, embedding_ndarray) pairs ready for graph operations.
+
+        When *namespace* is given, candidates outside it are dropped —
+        dedup, supersession, contradiction detection, and association
+        creation must never act across namespace boundaries (a write in
+        one project must not mutate another project's memories).
         """
-        hits = self.memory_index.search(embedding, k=k)
+        # Over-fetch when filtering so a namespace still gets ~k candidates
+        search_k = k * 3 if namespace is not None else k
+        hits = self.memory_index.search(embedding, k=search_k)
         if not hits:
             return []
 
@@ -2218,8 +2464,13 @@ class MemoryManager:
         results: List[Tuple[Memory, np.ndarray]] = []
         for mid, _ in hits:
             mem = mem_map.get(mid)
-            if mem and mem.embedding:
-                results.append((mem, np.array(mem.embedding, dtype=np.float32)))
+            if mem is None or not mem.embedding:
+                continue
+            if namespace is not None and mem.namespace != namespace:
+                continue
+            results.append((mem, np.array(mem.embedding, dtype=np.float32)))
+            if len(results) >= k:
+                break
 
         return results
 
@@ -2293,9 +2544,14 @@ class MemoryManager:
         self.passage_index.save()
 
     def _rebuild_faiss_indices(self):
-        """Rebuild both FAISS indices from SQLite data."""
+        """Rebuild both FAISS indices from SQLite data.
+
+        current_only: the primary index must contain exactly the
+        active+current set — rebuilding with superseded rows resurrects
+        vectors that supersession deliberately removed.
+        """
         mem_embs: Dict[str, list] = {}
-        for memory, emb in self.storage.get_memories_with_embeddings():
+        for memory, emb in self.storage.get_memories_with_embeddings(current_only=True):
             mem_embs[memory.id] = emb.tolist()
         self.memory_index.build_from_dict(mem_embs)
 
@@ -2526,6 +2782,17 @@ class MemoryManager:
         monitoring dashboards and health-check endpoints.
         """
         report: Dict[str, Any] = {"status": "ok", "issues": []}
+
+        # Embedding backend health: hash pseudo-embeddings mean every
+        # stored vector is semantically meaningless — surface it loudly.
+        fallback = bool(getattr(self.embeddings, "_using_fallback", False))
+        report["embedding_fallback"] = fallback
+        if fallback:
+            report["status"] = "degraded"
+            report["issues"].append(
+                "Embedding model unavailable — using hash pseudo-embeddings "
+                "(recall quality collapsed; stored vectors are poisoned)"
+            )
 
         # Database integrity
         try:

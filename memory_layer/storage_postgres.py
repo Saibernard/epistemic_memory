@@ -110,6 +110,9 @@ class PostgresStorage:
                 namespace TEXT DEFAULT 'default'
             );
 
+            ALTER TABLE memories
+                ADD COLUMN IF NOT EXISTS is_current INTEGER DEFAULT 1;
+
             CREATE TABLE IF NOT EXISTS memory_links (
                 id TEXT PRIMARY KEY,
                 source_id TEXT NOT NULL REFERENCES memories(id),
@@ -248,8 +251,11 @@ class PostgresStorage:
         return row[0] > 0
 
     def count_active_memories_with_embeddings(self) -> int:
+        # Index invariant: active AND current (see SQLite backend).
         row = self._fetchone(
-            "SELECT COUNT(*) FROM memories WHERE is_active = 1 AND embedding IS NOT NULL"
+            "SELECT COUNT(*) FROM memories "
+            "WHERE is_active = 1 AND is_current = 1 "
+            "AND embedding IS NOT NULL"
         )
         return row[0]
 
@@ -473,6 +479,7 @@ class PostgresStorage:
         memory_type: Optional[MemoryType] = None,
         min_strength: float = 0.0,
         namespace: Optional[str] = None,
+        current_only: bool = False,
     ) -> List[Tuple[Memory, np.ndarray]]:
         query = (
             "SELECT * FROM memories "
@@ -480,6 +487,8 @@ class PostgresStorage:
         )
         params: list = [min_strength]
 
+        if current_only:
+            query += " AND is_current = 1"
         if memory_type:
             query += " AND memory_type = %s"
             params.append(memory_type.value)

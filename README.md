@@ -46,9 +46,21 @@ memory-layer forget <memory-id>
 memory-layer stats
 ```
 
-### Use with Cursor (MCP)
+### Use with Claude Code / Cursor (MCP) — per-project memory
 
-Add this to your Cursor MCP settings (`.cursor/mcp.json`):
+Memory is **automatically scoped to each project**: the MCP server derives a
+namespace from the project directory it is launched in, so Claude working in
+`~/code/frontend-app` never sees `~/code/data-pipeline`'s memories. User-level
+facts (name, preferences, tools) go in a shared `global` namespace visible
+from every project — store them with `scope: "global"`.
+
+**Claude Code** (one command, from any project):
+
+```bash
+claude mcp add --scope user memory-layer -- memory-layer mcp
+```
+
+**Cursor** — add to `.cursor/mcp.json` (or `~/.cursor/mcp.json`):
 
 ```json
 {
@@ -61,7 +73,15 @@ Add this to your Cursor MCP settings (`.cursor/mcp.json`):
 }
 ```
 
-Restart Cursor. The AI now has 7 memory tools: `memory_remember`, `memory_recall`, `memory_forget`, `memory_record_episode`, `memory_stats`, `memory_ingest_document`, `memory_ingest_url`.
+Restart the client. The AI now has memory tools: `memory_remember` (with
+`scope: project|global`), `memory_recall` (project + global merged),
+`memory_forget`, `memory_record_episode`, `memory_stats`,
+`memory_ingest_document`, `memory_ingest_url`, `memory_health`,
+`memory_maintenance`, `memory_backup`, `memory_synthesize`.
+
+Everything runs locally (SQLite + FAISS + a local embedding model): no API
+key, no network, no per-call cost. Override the namespace explicitly with
+`MEMORY_NAMESPACE=<name>` if you want several folders to share one memory.
 
 ### Use as a REST API
 

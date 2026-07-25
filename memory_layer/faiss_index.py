@@ -18,6 +18,7 @@ Persistence:
 
 import os
 import json
+import threading
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +51,11 @@ class MemoryIndex:
     def __init__(self, dimension: int, index_path: Optional[str] = None):
         self.dimension   = dimension
         self.index_path  = index_path
+
+        # Reentrant lock serialising every index operation.  FAISS only
+        # guarantees concurrent *reads*; unsynchronised add/search from the
+        # background pool corrupts the ID↔row mapping permanently.
+        self._lock = threading.RLock()
 
         # ID mapping  (string ID → sequential int, and back)
         self._id_to_idx: Dict[str, int] = {}
@@ -92,40 +98,42 @@ class MemoryIndex:
     # ──────────────────────────────────────────
 
     def add(self, item_id: str, embedding: List[float]):
-        """Add (or replace) a vector in the index."""
+        """Add (or replace) a vector in the index.  Thread-safe."""
         vec = np.array(embedding, dtype=np.float32).reshape(1, -1)
 
-        if not self._using_faiss:
-            # Numpy fallback — just normalise and store
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            self._np_vectors[item_id] = vec.flatten()
-            return
+        with self._lock:
+            if not self._using_faiss:
+                # Numpy fallback — just normalise and store
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                self._np_vectors[item_id] = vec.flatten()
+                return
 
-        faiss.normalize_L2(vec)
+            faiss.normalize_L2(vec)
 
-        # If this ID is already indexed, mark the old row as deleted
-        if item_id in self._id_to_idx:
-            self._removed.add(self._id_to_idx[item_id])
+            # If this ID is already indexed, mark the old row as deleted
+            if item_id in self._id_to_idx:
+                self._removed.add(self._id_to_idx[item_id])
 
-        idx = self._next_idx
-        self._next_idx += 1
-        self._id_to_idx[item_id] = idx
-        self._idx_to_id[idx] = item_id
+            idx = self._next_idx
+            self._next_idx += 1
+            self._id_to_idx[item_id] = idx
+            self._idx_to_id[idx] = item_id
 
-        self.index.add(vec)
+            self.index.add(vec)
 
     def remove(self, item_id: str):
-        """Lazy-remove a vector from the index."""
-        if not self._using_faiss:
-            self._np_vectors.pop(item_id, None)
-            return
+        """Lazy-remove a vector from the index.  Thread-safe."""
+        with self._lock:
+            if not self._using_faiss:
+                self._np_vectors.pop(item_id, None)
+                return
 
-        if item_id in self._id_to_idx:
-            old_idx = self._id_to_idx.pop(item_id)
-            self._removed.add(old_idx)
-            self._idx_to_id.pop(old_idx, None)
+            if item_id in self._id_to_idx:
+                old_idx = self._id_to_idx.pop(item_id)
+                self._removed.add(old_idx)
+                self._idx_to_id.pop(old_idx, None)
 
     def search(
         self,
@@ -140,31 +148,34 @@ class MemoryIndex:
         """
         vec = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
 
-        if not self._using_faiss:
-            return self._numpy_search(vec, k)
+        with self._lock:
+            if not self._using_faiss:
+                return self._numpy_search(vec, k)
 
-        faiss.normalize_L2(vec)
+            faiss.normalize_L2(vec)
 
-        # Ask for extra results to compensate for lazy-deleted rows
-        search_k = min(k + len(self._removed) + 10, max(1, self.index.ntotal))
-        if search_k == 0 or self.index.ntotal == 0:
-            return []
+            # Ask for extra results to compensate for lazy-deleted rows
+            search_k = min(
+                k + len(self._removed) + 10, max(1, self.index.ntotal)
+            )
+            if search_k == 0 or self.index.ntotal == 0:
+                return []
 
-        scores, indices = self.index.search(vec, search_k)
+            scores, indices = self.index.search(vec, search_k)
 
-        results: List[Tuple[str, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            if idx in self._removed:
-                continue
-            item_id = self._idx_to_id.get(int(idx))
-            if item_id is None:
-                continue
-            results.append((item_id, float(score)))
-            if len(results) >= k:
-                break
-        return results
+            results: List[Tuple[str, float]] = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1:
+                    continue
+                if idx in self._removed:
+                    continue
+                item_id = self._idx_to_id.get(int(idx))
+                if item_id is None:
+                    continue
+                results.append((item_id, float(score)))
+                if len(results) >= k:
+                    break
+            return results
 
     # ──────────────────────────────────────────
     #  Bulk operations
@@ -176,66 +187,82 @@ class MemoryIndex:
 
         Automatically picks Flat vs IVF depending on collection size.
         """
-        self.clear()
+        with self._lock:
+            self.clear()
 
-        if not embeddings:
-            return
+            if not embeddings:
+                return
 
-        ids   = list(embeddings.keys())
-        vecs  = np.array(
-            [embeddings[i] for i in ids], dtype=np.float32,
-        )
-        faiss.normalize_L2(vecs) if self._using_faiss else None
+            ids   = list(embeddings.keys())
+            vecs  = np.array(
+                [embeddings[i] for i in ids], dtype=np.float32,
+            )
+            faiss.normalize_L2(vecs) if self._using_faiss else None
 
-        if self._using_faiss:
-            if len(ids) > self.IVF_THRESHOLD:
-                self._init_ivf(vecs)
+            if self._using_faiss:
+                if len(ids) > self.IVF_THRESHOLD:
+                    self._init_ivf(vecs)
+                else:
+                    self._init_flat()
+                self.index.add(vecs)
+                for seq, item_id in enumerate(ids):
+                    self._id_to_idx[item_id] = seq
+                    self._idx_to_id[seq] = item_id
+                self._next_idx = len(ids)
             else:
-                self._init_flat()
-            self.index.add(vecs)
-            for seq, item_id in enumerate(ids):
-                self._id_to_idx[item_id] = seq
-                self._idx_to_id[seq] = item_id
-            self._next_idx = len(ids)
-        else:
-            for item_id, vec_row in zip(ids, vecs):
-                norm = np.linalg.norm(vec_row)
-                self._np_vectors[item_id] = (
-                    vec_row / norm if norm > 0 else vec_row
-                )
+                for item_id, vec_row in zip(ids, vecs):
+                    norm = np.linalg.norm(vec_row)
+                    self._np_vectors[item_id] = (
+                        vec_row / norm if norm > 0 else vec_row
+                    )
 
     def clear(self):
         """Reset the index to empty."""
-        self._id_to_idx.clear()
-        self._idx_to_id.clear()
-        self._removed.clear()
-        self._next_idx = 0
-        self._np_vectors.clear()
-        if self._using_faiss:
-            self._init_flat()
+        with self._lock:
+            self._id_to_idx.clear()
+            self._idx_to_id.clear()
+            self._removed.clear()
+            self._next_idx = 0
+            self._np_vectors.clear()
+            if self._using_faiss:
+                self._init_flat()
 
     # ──────────────────────────────────────────
     #  Persistence
     # ──────────────────────────────────────────
 
     def save(self):
-        """Write the FAISS index + metadata to disk."""
+        """
+        Write the FAISS index + metadata to disk atomically.
+
+        Both files are written to temp paths and swapped in with
+        ``os.replace`` so a crash mid-save can never leave a mismatched
+        ``.faiss``/``.meta.json`` pair (which would silently corrupt the
+        ID↔vector mapping on the next load).
+        """
         if not self.index_path or not self._using_faiss or self.index is None:
             return
-        try:
-            faiss.write_index(self.index, self.index_path + ".faiss")
-            meta = {
-                "id_to_idx":  self._id_to_idx,
-                "idx_to_id":  {str(k): v for k, v in self._idx_to_id.items()},
-                "next_idx":   self._next_idx,
-                "removed":    list(self._removed),
-                "dimension":  self.dimension,
-                "index_type": self._index_type,
-            }
-            with open(self.index_path + ".meta.json", "w") as fh:
-                json.dump(meta, fh)
-        except Exception:
-            pass   # non-critical — index is rebuilt from SQLite on next load
+        with self._lock:
+            try:
+                faiss_path = self.index_path + ".faiss"
+                meta_path  = self.index_path + ".meta.json"
+                faiss.write_index(self.index, faiss_path + ".tmp")
+                meta = {
+                    "id_to_idx":  self._id_to_idx,
+                    "idx_to_id":  {
+                        str(k): v for k, v in self._idx_to_id.items()
+                    },
+                    "next_idx":   self._next_idx,
+                    "removed":    list(self._removed),
+                    "dimension":  self.dimension,
+                    "index_type": self._index_type,
+                }
+                with open(meta_path + ".tmp", "w") as fh:
+                    json.dump(meta, fh)
+                os.replace(faiss_path + ".tmp", faiss_path)
+                os.replace(meta_path + ".tmp", meta_path)
+            except Exception:
+                pass   # non-critical — index is rebuilt from SQLite on load
 
     def load(self) -> bool:
         """
@@ -249,25 +276,28 @@ class MemoryIndex:
         ):
             return False
 
-        try:
-            self.index = faiss.read_index(self.index_path + ".faiss")
-            with open(self.index_path + ".meta.json") as fh:
-                meta = json.load(fh)
-            self._id_to_idx = meta["id_to_idx"]
-            self._idx_to_id = {int(k): v for k, v in meta["idx_to_id"].items()}
-            self._next_idx  = meta["next_idx"]
-            self._removed   = set(meta.get("removed", []))
-            self._index_type = meta.get("index_type", "flat")
+        with self._lock:
+            try:
+                self.index = faiss.read_index(self.index_path + ".faiss")
+                with open(self.index_path + ".meta.json") as fh:
+                    meta = json.load(fh)
+                self._id_to_idx = meta["id_to_idx"]
+                self._idx_to_id = {
+                    int(k): v for k, v in meta["idx_to_id"].items()
+                }
+                self._next_idx  = meta["next_idx"]
+                self._removed   = set(meta.get("removed", []))
+                self._index_type = meta.get("index_type", "flat")
 
-            # Verify dimension matches
-            if meta.get("dimension") != self.dimension:
+                # Verify dimension matches
+                if meta.get("dimension") != self.dimension:
+                    self.clear()
+                    return False
+
+                return True
+            except Exception:
                 self.clear()
                 return False
-
-            return True
-        except Exception:
-            self.clear()
-            return False
 
     # ──────────────────────────────────────────
     #  Helpers

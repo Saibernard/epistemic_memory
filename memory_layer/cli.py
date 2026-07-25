@@ -119,21 +119,10 @@ def cmd_mcp(args):
     if config.getboolean("llm", "extract"):
         os.environ["MEMORY_LLM_EXTRACT"] = "1"
 
-    # Import and run the MCP server main loop
-    # mcp_server.py is at the project root; use the installed package entry point
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    mcp_path = os.path.join(parent_dir, "mcp_server.py")
-
-    if os.path.exists(mcp_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("mcp_server", mcp_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        mod.main()
-    else:
-        print("Error: mcp_server.py not found.", file=sys.stderr)
-        print("If installed via pip, use: python -m memory_layer.mcp", file=sys.stderr)
-        sys.exit(1)
+    # The MCP server ships inside the package, so this works identically
+    # from a source checkout and a pip install.
+    from .mcp import main as mcp_main
+    mcp_main()
 
 
 def cmd_remember(args):
@@ -522,6 +511,11 @@ def _run_chat_web(brain, engine, args):
 # ─────────────────────────────────────────────
 
 def main():
+    # Explicit .env support for CLI/server usage.  (Import-time loading was
+    # removed from core.py — it leaked real API keys into unit tests.)
+    from .core import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         prog="memory-layer",
         description="Memory Layer — persistent, evolving memory for AI. Local-first, no cloud required.",

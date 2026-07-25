@@ -62,7 +62,13 @@ _rate_limit_hits = defaultdict(deque)
 
 API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 RATE_LIMIT_RPM = int(os.environ.get("MEMORY_RATE_LIMIT_RPM", "120"))
-cors_raw = os.environ.get("MEMORY_CORS_ORIGINS", "*")
+# CORS defaults to localhost origins only.  A `*` default let any web page
+# a local user visited read/write their memory store via drive-by JS.
+cors_raw = os.environ.get(
+    "MEMORY_CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:8484,http://127.0.0.1:8484",
+)
 ALLOWED_ORIGINS = [o.strip() for o in cors_raw.split(",") if o.strip()]
 START_TIME = time.time()
 
@@ -175,7 +181,13 @@ def _check_api_key(request: Request):
     provided = request.headers.get("x-api-key", "").strip()
     auth = request.headers.get("authorization", "").strip()
     bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if provided != API_KEY and bearer != API_KEY:
+    # Timing-safe comparison — plain != leaks key bytes via timing
+    import hmac
+    ok = (
+        hmac.compare_digest(provided, API_KEY)
+        or hmac.compare_digest(bearer, API_KEY)
+    )
+    if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 

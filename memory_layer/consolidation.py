@@ -93,8 +93,10 @@ class ConsolidationEngine:
 
         already_consolidated = self.storage.get_consolidated_episode_ids()
 
+        # current_only: superseded episodes are dead facts — they must not
+        # feed newly synthesized semantic memories.
         episodes_with_emb = self.storage.get_memories_with_embeddings(
-            memory_type=MemoryType.EPISODIC
+            memory_type=MemoryType.EPISODIC, current_only=True
         )
 
         episodes_with_emb = [
@@ -107,7 +109,17 @@ class ConsolidationEngine:
 
         stats["episodes_analyzed"] = len(episodes_with_emb)
 
-        clusters = self._cluster_memories(episodes_with_emb)
+        # Partition by namespace before clustering: episodes from different
+        # projects/tenants must never blend into one semantic memory, and
+        # the synthesized memory must live in its sources' namespace.
+        by_namespace: Dict[str, list] = {}
+        for pair in episodes_with_emb:
+            by_namespace.setdefault(pair[0].namespace, []).append(pair)
+
+        clusters = []
+        for ns_pairs in by_namespace.values():
+            if len(ns_pairs) >= self.min_cluster_size:
+                clusters.extend(self._cluster_memories(ns_pairs))
         stats["clusters_found"] = len(clusters)
 
         for cluster in clusters:
@@ -260,6 +272,8 @@ class ConsolidationEngine:
             strength=1.0,
             confidence=round(min(0.85, avg_confidence), 3),
             epistemic_status=epistemic_status,
+            # Inherit the sources' namespace (clusters are single-namespace)
+            namespace=cluster[0].namespace,
             tags=unique_tags + ["consolidated"],
             source_episode_ids=[m.id for m in cluster],
             metadata={
@@ -371,11 +385,16 @@ class ConsolidationEngine:
             "links_created": 0,
         }
 
+        # Skip patterns already abstracted into a trait — without this
+        # guard every consolidation pass re-clustered the same level-1
+        # memories and created an unbounded stream of duplicate traits.
+        already_consolidated = self.storage.get_consolidated_episode_ids()
+
         level1_mems = [
             m for m in self.storage.get_all_memories(
                 memory_type=MemoryType.SEMANTIC, active_only=True,
             )
-            if m.abstraction_level == 1
+            if m.abstraction_level == 1 and m.id not in already_consolidated
         ]
 
         if len(level1_mems) < self.min_cluster_size:
@@ -389,12 +408,23 @@ class ConsolidationEngine:
                 )
 
         stats["patterns_analyzed"] = len(level1_with_emb)
-        clusters = self._cluster_memories(level1_with_emb)
+
+        # Never blend namespaces into one trait
+        by_ns: Dict[str, list] = {}
+        for pair in level1_with_emb:
+            by_ns.setdefault(pair[0].namespace, []).append(pair)
+        clusters = []
+        for ns_pairs in by_ns.values():
+            if len(ns_pairs) >= self.min_cluster_size:
+                clusters.extend(self._cluster_memories(ns_pairs))
 
         for cluster in clusters:
             trait_mem = self._synthesize_trait(cluster)
             if trait_mem:
+                trait_mem.namespace = cluster[0].namespace
                 trait_mem.embedding = self.embeddings.embed(trait_mem.content)
+                if self._is_duplicate_semantic(trait_mem):
+                    continue
                 self.storage.store_memory(trait_mem)
                 stats["traits_created"] += 1
 
@@ -429,11 +459,14 @@ class ConsolidationEngine:
             "links_created": 0,
         }
 
+        # Same guard as level 1→2: don't re-consolidate consumed traits.
+        already_consolidated = self.storage.get_consolidated_episode_ids()
+
         level2_mems = [
             m for m in self.storage.get_all_memories(
                 memory_type=MemoryType.SEMANTIC, active_only=True,
             )
-            if m.abstraction_level == 2
+            if m.abstraction_level == 2 and m.id not in already_consolidated
         ]
 
         if len(level2_mems) < 2:
@@ -447,12 +480,22 @@ class ConsolidationEngine:
                 )
 
         stats["traits_analyzed"] = len(level2_with_emb)
-        clusters = self._cluster_memories(level2_with_emb)
+
+        by_ns: Dict[str, list] = {}
+        for pair in level2_with_emb:
+            by_ns.setdefault(pair[0].namespace, []).append(pair)
+        clusters = []
+        for ns_pairs in by_ns.values():
+            if len(ns_pairs) >= 2:
+                clusters.extend(self._cluster_memories(ns_pairs))
 
         for cluster in clusters:
             identity_mem = self._synthesize_identity(cluster)
             if identity_mem:
+                identity_mem.namespace = cluster[0].namespace
                 identity_mem.embedding = self.embeddings.embed(identity_mem.content)
+                if self._is_duplicate_semantic(identity_mem):
+                    continue
                 self.storage.store_memory(identity_mem)
                 stats["identity_created"] += 1
 

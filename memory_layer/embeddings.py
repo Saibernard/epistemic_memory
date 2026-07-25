@@ -116,14 +116,33 @@ class LocalEmbeddingEngine:
 
         self._load_model()
 
+    def _allow_fallback(self) -> bool:
+        """Hash pseudo-embeddings are OPT-IN (tests/CI only).
+
+        Silently degrading to hash vectors permanently poisons the store:
+        the dimension matches, so nothing ever detects it, and recall
+        quality collapses with no error surfaced anywhere.
+        """
+        return os.environ.get("MEMORY_ALLOW_HASH_FALLBACK", "0") in (
+            "1", "true", "yes",
+        )
+
     def _load_model(self):
         """Load the sentence-transformers model with user-friendly messaging."""
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError:
+            if not self._allow_fallback():
+                raise RuntimeError(
+                    "sentence-transformers is not installed and hash-embedding "
+                    "fallback is disabled (it silently poisons the memory store "
+                    "with meaningless vectors). Install it with:\n"
+                    "    pip install sentence-transformers\n"
+                    "or explicitly opt in for testing with "
+                    "MEMORY_ALLOW_HASH_FALLBACK=1."
+                )
             print("  ⚠ sentence-transformers not installed.")
-            print("    Install it:  pip install sentence-transformers")
-            print("    Using fallback hash embeddings (reduced quality).")
+            print("    Using fallback hash embeddings (TESTING ONLY).")
             self.model = None
             self._using_fallback = True
             return
@@ -157,9 +176,20 @@ class LocalEmbeddingEngine:
             else:
                 print(f"    Error: {error_str[:200]}")
 
-            print("    Using fallback hash embeddings (reduced quality).")
+            if not self._allow_fallback():
+                raise RuntimeError(
+                    f"Could not load embedding model '{self.model_name}' "
+                    f"({error_str[:200]}). Refusing to fall back to hash "
+                    "pseudo-embeddings, which would permanently poison the "
+                    "store. Fix the model download (network/disk), switch "
+                    "embedding mode, or set MEMORY_ALLOW_HASH_FALLBACK=1 "
+                    "for testing."
+                )
+            print("    Using fallback hash embeddings (TESTING ONLY).")
             self.model = None
             self._using_fallback = True
+
+    _CACHE_MAX = 10_000   # bound the embed cache (long-running servers)
 
     def embed(self, text: str) -> List[float]:
         """Generate embedding for a single text string."""
@@ -171,6 +201,9 @@ class LocalEmbeddingEngine:
         else:
             embedding = self._fallback_embed(text)
 
+        if len(self._cache) >= self._CACHE_MAX:
+            # Drop the oldest entry (dicts preserve insertion order)
+            self._cache.pop(next(iter(self._cache)))
         self._cache[text] = embedding
         return embedding
 

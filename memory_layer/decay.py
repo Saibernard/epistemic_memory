@@ -158,6 +158,18 @@ class DecayEngine:
     def _process_batch(
         self, batch: List[Memory], storage: MemoryStorage, stats: Dict
     ):
+        """
+        Deactivate truly-forgotten memories; otherwise WRITE NOTHING.
+
+        The stored ``strength`` column means "strength as of
+        ``last_accessed``" and every read path computes the live decayed
+        value via :meth:`compute_current_strength`.  Writing the decayed
+        value back without resetting ``last_accessed`` (the old behaviour)
+        double-counted the elapsed interval on every subsequent pass —
+        memories were forgotten far faster than the Ebbinghaus curve
+        intends — and the full-row write raced with concurrent recall
+        reinforcement (lost updates).
+        """
         for memory in batch:
             current_strength = self.compute_current_strength(memory)
             stats["processed"] += 1
@@ -166,9 +178,7 @@ class DecayEngine:
                 storage.deactivate_memory(memory.id)
                 stats["forgotten"] += 1
             elif current_strength < memory.strength * 0.99:
-                memory.strength = current_strength
-                storage.update_memory(memory)
-                stats["decayed"] += 1
+                stats["decayed"] += 1   # decays live at read time; no write
             else:
                 stats["stable"] += 1
 
@@ -189,9 +199,15 @@ class DecayEngine:
             type_mult = TYPE_STABILITY_MULTIPLIERS.get(
                 memory.memory_type.value, 1.0,
             )
+            # Match compute_current_strength: abstraction level matters
+            level = getattr(memory, "abstraction_level", 0) or 0
+            level_mult = LEVEL_STABILITY_MULTIPLIERS.get(level, 1.0)
             importance_factor = 1.0 + (memory.importance * self.importance_multiplier)
             access_factor = math.log(2 + memory.access_count)
-            stability = self.base_stability * type_mult * importance_factor * access_factor
+            stability = (
+                self.base_stability * type_mult * level_mult
+                * importance_factor * access_factor
+            )
 
             projected = memory.strength * math.exp(-time_elapsed / stability)
             if projected <= self.min_strength:

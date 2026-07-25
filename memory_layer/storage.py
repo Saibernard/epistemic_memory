@@ -792,11 +792,20 @@ class MemoryStorage:
         return cursor.fetchone()[0] > 0
 
     def count_active_memories_with_embeddings(self) -> int:
-        """Count active memories that have non-NULL embeddings."""
+        """
+        Count memories that belong in the primary FAISS index.
+
+        The index invariant is *active AND current*: superseded memories
+        (is_current = 0) are deliberately removed from the primary index at
+        supersede time, so they must not be counted here — otherwise the
+        sync check reports "stale" forever and every rebuild resurrects
+        vectors that were intentionally removed.
+        """
         cursor = self._conn().cursor()
         cursor.execute(
             "SELECT COUNT(*) FROM memories "
-            "WHERE is_active = 1 AND embedding IS NOT NULL"
+            "WHERE is_active = 1 AND is_current = 1 "
+            "AND embedding IS NOT NULL"
         )
         return cursor.fetchone()[0]
 
@@ -1115,10 +1124,16 @@ class MemoryStorage:
         memory_type: Optional[MemoryType] = None,
         min_strength: float = 0.0,
         namespace: Optional[str] = None,
+        current_only: bool = False,
     ) -> List[Tuple[Memory, np.ndarray]]:
         """
         Get active memories along with their numpy embedding arrays.
         Used for similarity search operations.
+
+        ``current_only=True`` restricts to is_current = 1 — required by the
+        FAISS rebuild/reindex paths so superseded memories are never
+        resurrected into the primary index, and by consolidation so dead
+        facts don't feed new semantic memories.
         """
         query = (
             "SELECT * FROM memories "
@@ -1126,6 +1141,8 @@ class MemoryStorage:
         )
         params: list = [min_strength]
 
+        if current_only:
+            query += " AND is_current = 1"
         if memory_type:
             query += " AND memory_type = ?"
             params.append(memory_type.value)

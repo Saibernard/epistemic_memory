@@ -68,6 +68,7 @@ class StorageBackend(Protocol):
         memory_type: Optional[MemoryType] = None,
         min_strength: float = 0.0,
         namespace: Optional[str] = None,
+        current_only: bool = False,
     ) -> List[Tuple[Memory, np.ndarray]]: ...
     def store_passages(self, memory_id: str, passages: List[Dict]) -> None: ...
     def get_all_passage_embeddings(
